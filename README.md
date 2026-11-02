@@ -1,6 +1,8 @@
 # 二进制 · 惊异之学
 
-单文件夹自包含 H5 知识讲解片（约 3 分 40 秒）。五幕结构 + 开场钩子回调；旁白为预合成中文语音（`audio/n*.mp3`），并保留 Web Speech API 回退；环境音与轻 SFX 由 Web Audio 生成。
+> **BGM 说明：** 背景节奏为 **Web Audio API 程序合成**（约 113 BPM、16 拍 ≈ 8.5s 循环、F 持续低音、稀疏 Eb/F/Fm 和弦垫），灵感来自对「上头 BGM」类知识片节奏公式的拆解笔记，**不是**抖音原曲 stem / 版权音轨投放。`audio/bgm.mp3` 可留在磁盘作对照，默认关闭（`USE_MP3_BGM = false`）。
+
+单文件夹自包含 H5 知识讲解片（约 3 分 40 秒）。五幕结构 + 开场钩子回调；旁白为预合成中文语音（`audio/n*.mp3`），并保留 Web Speech API 回退；环境音、轻 SFX 与程序化 BGM 均由 Web Audio 生成。
 
 ## 打开
 
@@ -26,4 +28,5 @@ python3 -m http.server 8766
 
 - 主旁白：文件夹内 `audio/n01.mp3`–`n26.mp3`（edge-tts 中文神经音色，略慢）。
 - 回退：若音频加载失败，尝试浏览器 `speechSynthesis`（需系统中文语音包）。
+- 环境床音：默认程序化 Web Audio（113 BPM / F 踏板 / Eb·F·Fm·Fm；封面点击后解锁；音量约 0.14，旁白时 duck 至约 0.055）。可选 `USE_MP3_BGM` 回退到 `audio/bgm.mp3`（仅调试）。
 - 浏览器通常要求先有用户手势才能出声；请从封面点击开始，不要静默自动播放。

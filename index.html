@@ -511,6 +511,249 @@
   let audioCtx = null;
   let ambientNodes = null;
 
+  // ─── Procedural vibe BGM (Web Audio; MP3 optional debug) ──────────
+  // Inspired by vibe breakdown: 113 BPM, ~8.5s loop, F pedal, Eb/F/Fm/Fm.
+  // Not a copyrighted stem — synthesized locally.
+  const USE_MP3_BGM = false; // debug: true → audio/bgm.mp3 instead of synth
+  const BGM_BPM = 113;
+  const BGM_BEAT = 60 / BGM_BPM;           // ≈0.531s
+  const BGM_LOOP_BEATS = 16;               // 16 beats ≈ 8.495s
+  const BGM_VOL = 0.14;
+  const BGM_DUCK = 0.055;
+  const BGM_FADE = 0.8;
+  // Chord cells (Hz): Eb · F · Fm · Fm — sparse cinematic pads
+  const BGM_CHORDS = [
+    [155.56, 196.00, 233.08], // Eb
+    [174.61, 220.00, 261.63], // F
+    [174.61, 207.65, 261.63], // Fm
+    [174.61, 207.65, 261.63]  // Fm
+  ];
+  const BGM_F2 = 87.31;
+  const BGM_F1 = 43.65;
+
+  let bgm = null;              // HTMLAudioElement only if USE_MP3_BGM
+  let bgmGraph = null;         // Web Audio graph
+  let bgmRunning = false;
+  let bgmFadeToken = 0;
+  let bgmDuckTimer = null;
+  let bgmSchedTimer = null;
+  let bgmNextBeatTime = 0;
+  let bgmBeatIndex = 0;
+  let bgmTargetVol = BGM_VOL;
+
+  function ensureBgmGraph() {
+    const ac = ensureAudio();
+    if (bgmGraph) return bgmGraph;
+    const master = ac.createGain();
+    master.gain.value = 0;
+    master.connect(ac.destination);
+
+    // Pinned bass on F (pedal)
+    const bass = ac.createOscillator();
+    bass.type = "sine";
+    bass.frequency.value = BGM_F2;
+    const bassLp = ac.createBiquadFilter();
+    bassLp.type = "lowpass";
+    bassLp.frequency.value = 260;
+    bassLp.Q.value = 0.7;
+    const bassG = ac.createGain();
+    bassG.gain.value = 0.42;
+    bass.connect(bassLp); bassLp.connect(bassG); bassG.connect(master);
+
+    const sub = ac.createOscillator();
+    sub.type = "sine";
+    sub.frequency.value = BGM_F1;
+    const subG = ac.createGain();
+    subG.gain.value = 0.22;
+    sub.connect(subG); subG.connect(master);
+
+    bass.start();
+    sub.start();
+    bgmGraph = { master, bass, sub, bassG, subG };
+    return bgmGraph;
+  }
+
+  function scheduleSoftPulse(ac, master, t) {
+    const o = ac.createOscillator();
+    const g = ac.createGain();
+    const f = ac.createBiquadFilter();
+    o.type = "sine";
+    o.frequency.value = 98;
+    f.type = "lowpass";
+    f.frequency.value = 180;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.045, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.28);
+    o.connect(f); f.connect(g); g.connect(master);
+    o.start(t);
+    o.stop(t + 0.32);
+  }
+
+  function scheduleChordPad(ac, master, t, freqs) {
+    const dur = BGM_BEAT * 4 * 0.92;
+    freqs.forEach(function (hz, i) {
+      const o = ac.createOscillator();
+      const g = ac.createGain();
+      const f = ac.createBiquadFilter();
+      o.type = i === 0 ? "triangle" : "sine";
+      o.frequency.value = hz;
+      f.type = "lowpass";
+      f.frequency.value = 900;
+      const peak = 0.028 - i * 0.006;
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(Math.max(0.004, peak), t + 0.35);
+      g.gain.setValueAtTime(Math.max(0.004, peak * 0.85), t + dur * 0.55);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(f); f.connect(g); g.connect(master);
+      o.start(t);
+      o.stop(t + dur + 0.05);
+    });
+  }
+
+  function scheduleBeat(t, beatIdx) {
+    if (!bgmGraph || !audioCtx) return;
+    const ac = audioCtx;
+    const master = bgmGraph.master;
+    scheduleSoftPulse(ac, master, t);
+    if (beatIdx % 4 === 0) {
+      const chord = BGM_CHORDS[Math.floor(beatIdx / 4) % BGM_CHORDS.length];
+      scheduleChordPad(ac, master, t, chord);
+    }
+  }
+
+  function bgmSchedulerTick() {
+    if (!bgmRunning || !audioCtx || !bgmGraph) return;
+    const ac = audioCtx;
+    const horizon = ac.currentTime + 1.25;
+    while (bgmNextBeatTime < horizon) {
+      scheduleBeat(bgmNextBeatTime, bgmBeatIndex);
+      bgmNextBeatTime += BGM_BEAT;
+      bgmBeatIndex = (bgmBeatIndex + 1) % BGM_LOOP_BEATS;
+    }
+  }
+
+  function ensureMp3Bgm() {
+    if (bgm) return bgm;
+    bgm = new Audio("audio/bgm.mp3");
+    bgm.loop = true;
+    bgm.preload = "auto";
+    bgm.volume = 0;
+    return bgm;
+  }
+
+  function fadeBgmTo(target, seconds) {
+    bgmTargetVol = target;
+    const dur = Math.max(0.05, seconds == null ? BGM_FADE : seconds);
+    if (USE_MP3_BGM) {
+      const a = ensureMp3Bgm();
+      const startVol = a.volume;
+      const ms = dur * 1000;
+      const tStart = performance.now();
+      const token = ++bgmFadeToken;
+      function step(now) {
+        if (token !== bgmFadeToken) return;
+        const p = Math.min(1, (now - tStart) / ms);
+        a.volume = startVol + (target - startVol) * p;
+        if (p < 1) requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+      return;
+    }
+    const g = ensureBgmGraph().master.gain;
+    const ac = audioCtx;
+    const token = ++bgmFadeToken;
+    const now = ac.currentTime;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    g.linearRampToValueAtTime(target, now + dur);
+    // token kept so overlapping fades invalidate older pause/stop timers
+    void token;
+  }
+
+  function startBgm() {
+    if (USE_MP3_BGM) {
+      const a = ensureMp3Bgm();
+      const p = a.play();
+      if (p && p.catch) p.catch(function () {});
+      fadeBgmTo(BGM_VOL, BGM_FADE);
+      return;
+    }
+    ensureAudio();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    ensureBgmGraph();
+    if (!bgmRunning) {
+      bgmRunning = true;
+      // Resume from next beat; phase reset only via resetBgmPhase / stopBgm(true)
+      if (!bgmNextBeatTime || bgmNextBeatTime < audioCtx.currentTime) {
+        bgmNextBeatTime = audioCtx.currentTime + 0.06;
+      }
+      bgmSchedulerTick();
+      if (bgmSchedTimer) clearInterval(bgmSchedTimer);
+      bgmSchedTimer = setInterval(bgmSchedulerTick, 100);
+    }
+    fadeBgmTo(BGM_VOL, BGM_FADE);
+  }
+
+  function pauseBgm() {
+    fadeBgmTo(0, 0.35);
+    const token = bgmFadeToken;
+    setTimeout(function () {
+      if (token !== bgmFadeToken) return;
+      if (playing) return;
+      if (USE_MP3_BGM) {
+        if (bgm) { try { bgm.pause(); } catch (_) {} }
+        return;
+      }
+      bgmRunning = false;
+      if (bgmSchedTimer) { clearInterval(bgmSchedTimer); bgmSchedTimer = null; }
+    }, 400);
+  }
+
+  function stopBgm(reset) {
+    fadeBgmTo(0, BGM_FADE);
+    const token = bgmFadeToken;
+    setTimeout(function () {
+      if (token !== bgmFadeToken) return;
+      if (USE_MP3_BGM) {
+        try {
+          if (bgm) {
+            bgm.pause();
+            if (reset) bgm.currentTime = 0;
+          }
+        } catch (_) {}
+        return;
+      }
+      bgmRunning = false;
+      if (bgmSchedTimer) { clearInterval(bgmSchedTimer); bgmSchedTimer = null; }
+      if (reset) {
+        bgmBeatIndex = 0;
+        if (audioCtx) bgmNextBeatTime = audioCtx.currentTime + 0.06;
+      }
+    }, Math.floor(BGM_FADE * 1000) + 50);
+  }
+
+  function duckBgm(on) {
+    if (USE_MP3_BGM) {
+      if (!bgm && !bgmGraph) return;
+    } else if (!bgmGraph) {
+      return;
+    }
+    if (bgmDuckTimer) { clearTimeout(bgmDuckTimer); bgmDuckTimer = null; }
+    if (on) fadeBgmTo(BGM_DUCK, 0.25);
+    else fadeBgmTo(BGM_VOL, 0.45);
+  }
+
+  function resetBgmPhase() {
+    if (USE_MP3_BGM) {
+      if (bgm) { try { bgm.currentTime = 0; } catch (_) {} }
+      return;
+    }
+    bgmBeatIndex = 0;
+    if (audioCtx && bgmRunning) {
+      bgmNextBeatTime = audioCtx.currentTime + 0.05;
+    }
+  }
+
   // ─── Audio (ambient + SFX via Web Audio) ──────────────────────────
   function ensureAudio() {
     if (audioCtx) return audioCtx;
@@ -618,6 +861,7 @@
     }
     try { window.speechSynthesis && window.speechSynthesis.cancel(); } catch (_) {}
     uttering = null;
+    if (playing) duckBgm(false);
   }
 
   function speakFallbackTTS(text) {
@@ -632,15 +876,19 @@
     const zh = voices.find(v => /zh(-|_)?CN|Chinese|普通话|国语/i.test(v.lang + v.name));
     if (zh) u.voice = zh;
     uttering = u;
+    u.onend = function () { duckBgm(false); };
+    u.onerror = function () { duckBgm(false); };
     window.speechSynthesis.speak(u);
   }
 
   function speak(text, audioSrc) {
     stopSpeak();
+    duckBgm(true);
     if (audioSrc) {
       const a = new Audio(audioSrc);
       a.preload = "auto";
       narrAudio = a;
+      a.onended = function () { duckBgm(false); };
       const p = a.play();
       if (p && p.catch) {
         p.catch(() => speakFallbackTTS(text));
@@ -1040,6 +1288,7 @@
         elapsed = TOTAL;
         playing = false;
         stopSpeak();
+        stopBgm(true);
         btnPlay.textContent = "▶";
         endcard.classList.add("show");
       }
@@ -1158,6 +1407,7 @@
     btnPlay.textContent = "❚❚";
     endcard.classList.remove("show");
     controls.classList.add("visible");
+    startBgm();
     // re-trigger speech for current beat
     spokenIdx = -1;
     lastBeatIdx = -1;
@@ -1167,6 +1417,7 @@
     playing = false;
     btnPlay.textContent = "▶";
     stopSpeak();
+    pauseBgm();
   }
 
   function toggle() {
@@ -1193,6 +1444,7 @@
     lastBeatIdx = -1;
     stopSpeak();
     endcard.classList.remove("show");
+    resetBgmPhase();
     play();
   }
 
